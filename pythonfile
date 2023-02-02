@@ -1,0 +1,96 @@
+
+rev_gp_nfa = ['revenue','gross_profit','net_fixed']
+for x in rev_gp_nfa:
+    for files in os.listdir(InputDir+'/'):
+        if files.startswith('FileNum_') and files.endswith(x+'_segment.parquet')  :
+            utils_seg_check_rev_df = pd.read_parquet(InputDir+'/'+files)
+            print(files,' :: ',utils_seg_check_rev_df.shape)
+            
+            if x == 'revenue':
+                utils_segmentation_df = utils_segment_revenue_df            
+            elif x == 'gross_profit':
+                utils_segmentation_df = utils_segment_gprofit_df
+            elif x == 'net_fixed':
+                utils_segmentation_df = utils_segment_net_fixed_df            
+            resultant_tmp_df = []
+            resultant_df = pd.DataFrame()
+            for issuer in [y for y in utils_seg_check_rev_df.issuer_name.drop_duplicates().to_list()]:
+                unique_scenarios = utils_seg_check_rev_df.scenario.unique() 
+                for scenario in [z for z in unique_scenarios]:                   
+                    unique_buss_segs = utils_segmentation_df[(utils_segmentation_df.scenario==scenario) & (utils_segmentation_df.issuer_name==issuer)].business_segment.drop_duplicates().to_list()#.unique()
+                    for business_segs in [n for n in unique_buss_segs]:
+                        unq_seg_scenario_issuer_df = utils_seg_check_rev_df[(utils_seg_check_rev_df.scenario==scenario) & (utils_seg_check_rev_df.issuer_name==issuer)]   # & (utils_seg_check_rev_df.business_segment==business_segs)
+
+                        unq_seg_scenario_issuer_df["YoYDiff_2yr_"+str(business_segs)] = abs( unq_seg_scenario_issuer_df[business_segs] - unq_seg_scenario_issuer_df.shift(2)[business_segs])
+                                
+                        unq_seg_scenario_issuer_df["YoYSpike_"+str(business_segs)] = abs( unq_seg_scenario_issuer_df.shift(1)[business_segs] - unq_seg_scenario_issuer_df.shift(-1)[business_segs] ) -  abs( unq_seg_scenario_issuer_df[business_segs] - unq_seg_scenario_issuer_df.shift(-1)[business_segs] )
+                
+                        Tx_YoY_base_yr_val = np.where((unq_seg_scenario_issuer_df.year==base_year), unq_seg_scenario_issuer_df[business_segs], 0)
+                        Tx_YoY_mid_yr_val  = np.where((unq_seg_scenario_issuer_df.year==mid_year), unq_seg_scenario_issuer_df[business_segs], 0)
+                        Tx_YoY_end_yr_val  = np.where((unq_seg_scenario_issuer_df.year==end_year), unq_seg_scenario_issuer_df[business_segs], 0)
+                        Tx_YoY_base_yr_val = np.sum(Tx_YoY_base_yr_val)
+                        unq_seg_scenario_issuer_df["YoYDiff_mid_yr_"+str(business_segs)] = abs(np.sum(Tx_YoY_mid_yr_val) - Tx_YoY_base_yr_val)
+                        unq_seg_scenario_issuer_df["YoYDiff_end_yr_"+str(business_segs)] = abs(np.sum(Tx_YoY_end_yr_val) - Tx_YoY_base_yr_val)
+                        resultant_tmp_df.append(unq_seg_scenario_issuer_df)
+                        
+            resultant_df = pd.concat(resultant_tmp_df)
+            all_cols = list(resultant_df.columns)
+            YOY_Diff_cols = list(resultant_df.filter(regex='YoYDiff_').columns)
+            YoYSpike_cols = list(resultant_df.filter(regex='YoYSpike_').columns)
+            YOY_cols = YOY_Diff_cols + YoYSpike_cols          
+            
+            leftcols =  list((Counter(all_cols) - Counter(YOY_cols)).elements())
+            resultant_df = resultant_df.groupby(leftcols).sum().reset_index()
+            resultant_df.to_parquet(InputDir + '/' + files + x +'.parquet', index = False)
+            #resultant_df.to_csv(InputDir + '/' + files + x +'.csv', index = False)   
+            res_outlier_tmp_df = []
+            res_outlier_df = pd.DataFrame()
+            res_df = pd.DataFrame()
+            for i in range(len(resultant_df)):
+                for colx in [y for y in YOY_Diff_cols]:  
+                    if ( resultant_df[colx].values[i] >= YoY_time_point_diff ): 
+                        res_df = resultant_df.iloc[i]
+                        res_outlier_tmp_df.append(res_df)
+                for coly in [y for y in YOY_Diff_cols]:  
+                    if ( resultant_df[coly].values[i] <= YoY_spike_Diff ): 
+                        res_df = resultant_df.iloc[i]
+                        res_outlier_tmp_df.append(res_df)
+            if res_outlier_tmp_df:
+                res_outlier_df = pd.DataFrame(res_outlier_tmp_df)  #pd.concat(res_outlier_tmp_df)                 
+                res_outlier_df.drop_duplicates(inplace=True)        
+                res_outlier_df = res_outlier_df.reindex( resultant_df.columns , axis = 1)
+            
+                res_out_all_tmp_df = []
+                res_out_all_df = pd.DataFrame()
+                res_outlr_df = pd.DataFrame()
+                col_append = ''
+                if len(res_outlier_df):
+                    for issuer in [iss for iss in res_outlier_df.issuer_name.drop_duplicates().to_list()]:
+                        m_res_df = res_outlier_df[(res_outlier_df.issuer_name==issuer)].reset_index(drop=True)
+                        for i in range(len(m_res_df)):
+                            for colx in [y for y in YOY_Diff_cols]:  
+                                if ( m_res_df[colx].values[i] >= YoY_time_point_diff ): 
+                                    col_append = colx+','+col_append 
+                            for coly in [y for y in YoYSpike_cols]:  
+                                if ( m_res_df[coly].values[i] <= YoY_spike_Diff ):
+                                    col_append = coly+','+col_append
+                        if ( (str( set( list(col_append.split(',')) ) ) != {''})  ) : 
+                            res_outlr_df = m_res_df[(m_res_df.issuer_name == issuer)]
+                            res_outlr_df['Outlier Reason'] = str( set( list(col_append.split(',')) ) ) 
+                            res_out_all_tmp_df.append(res_outlr_df[(res_outlr_df.issuer_name == issuer)])
+                            res_outlr_df['Outlier Reason']= ''
+                        col_append = ''  
+                if res_out_all_tmp_df:
+                    res_out_all_df = pd.concat(res_out_all_tmp_df) #pd.DataFrame(res_out_all_tmp_df) #
+                    res_out_all_df.drop_duplicates(inplace=True) 
+
+                    diff_col = 'Outlier Reason'
+                    new_cols = list(resultant_df.columns)
+                    new_cols += [diff_col]
+                    res_out_all_df = res_out_all_df.reindex( new_cols , axis = 1)          
+
+                    res_out_all_df.to_parquet(InputDir + '/' + files + x +'Outliers_Data.parquet', index = False)
+        else:
+            continue
+end = datetime.now()
+print('Time Taken for processing : ', end - start) 
